@@ -64,6 +64,22 @@ class Classroom:
     def get_student(self, roll_no):
         return self._students_by_roll.get(roll_no)
 
+    def update_student(self, student):
+        existing_student = self._students_by_roll.get(student.roll_no)
+        if existing_student is None:
+            return False
+
+        student_index = self.students.index(existing_student)
+        self.students[student_index] = student
+        self._students_by_roll[student.roll_no] = student
+        try:
+            self.save_details()
+        except Exception:
+            self.students[student_index] = existing_student
+            self._students_by_roll[student.roll_no] = existing_student
+            raise
+        return True
+
     def remove_student(self, roll_no):
         student = self._students_by_roll.get(roll_no)
         if student is None:
@@ -396,15 +412,15 @@ class StudentManagementApp:
         )
         form.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
         form.columnconfigure(1, weight=1)
-        ttk.Label(form, text="Add a student", style="PanelTitle.TLabel").grid(
-            row=0, column=0, columnspan=2, sticky="w"
-        )
-        ttk.Label(
+        self.form_title = ttk.Label(form, text="Add a student", style="PanelTitle.TLabel")
+        self.form_title.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.form_hint = ttk.Label(
             form,
             text="Enter the details below to create a new record.",
             style="PanelHint.TLabel",
             wraplength=265,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 14))
+        )
+        self.form_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 14))
 
         self.entries = {}
         fields = (
@@ -424,7 +440,11 @@ class StudentManagementApp:
             entry.grid(row=row, column=1, sticky="ew", pady=5)
             self.entries[key] = entry
 
-        ttk.Button(form, text="Add student", command=self.add_student).grid(
+        self.editing_roll_no = None
+        self.submit_button = ttk.Button(
+            form, text="Add student", command=self.add_student
+        )
+        self.submit_button.grid(
             row=len(fields) + 2,
             column=0,
             columnspan=2,
@@ -504,6 +524,12 @@ class StudentManagementApp:
         actions.grid(row=3, column=0, sticky="ew", pady=(13, 0))
         ttk.Button(
             actions,
+            text="Edit selected",
+            command=self.edit_selected,
+            style="Secondary.TButton",
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            actions,
             text="View details",
             command=self.show_selected_details,
             style="Secondary.TButton",
@@ -581,43 +607,10 @@ class StudentManagementApp:
         return value_label
 
     def add_student(self):
-        values = {key: entry.get().strip() for key, entry in self.entries.items()}
-        missing = [key.replace("_", " ") for key, value in values.items() if not value]
-        if missing:
-            messagebox.showerror(
-                "Missing information",
-                "Please fill in: " + ", ".join(missing) + ".",
-                parent=self.root,
-            )
+        student = self._student_from_form(self.classroom.next_roll_no)
+        if student is None:
             return
 
-        try:
-            age = int(values["age"])
-            if age < 1:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid age", "Age must be a positive whole number.", parent=self.root)
-            return
-
-        phone = values["parent_phone"]
-        if len(phone) != 10 or not phone.isdigit():
-            messagebox.showerror(
-                "Invalid phone number",
-                "Parent phone must contain exactly 10 digits.",
-                parent=self.root,
-            )
-            return
-
-        student = Student(
-            self.classroom.next_roll_no,
-            values["name"],
-            age,
-            values["address"],
-            values["parent_name"],
-            phone,
-            values["previous_result"],
-            values["test_marks"],
-        )
         try:
             self.classroom.add_student(student)
         except (OSError, pickle.PickleError) as error:
@@ -632,9 +625,92 @@ class StudentManagementApp:
             parent=self.root,
         )
 
+    def _student_from_form(self, roll_no):
+        values = {key: entry.get().strip() for key, entry in self.entries.items()}
+        missing = [key.replace("_", " ") for key, value in values.items() if not value]
+        if missing:
+            messagebox.showerror(
+                "Missing information",
+                "Please fill in: " + ", ".join(missing) + ".",
+                parent=self.root,
+            )
+            return None
+
+        try:
+            age = int(values["age"])
+            if age < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid age", "Age must be a positive whole number.", parent=self.root)
+            return None
+
+        phone = values["parent_phone"]
+        if len(phone) != 10 or not phone.isdigit():
+            messagebox.showerror(
+                "Invalid phone number",
+                "Parent phone must contain exactly 10 digits.",
+                parent=self.root,
+            )
+            return None
+
+        return Student(
+            roll_no,
+            values["name"],
+            age,
+            values["address"],
+            values["parent_name"],
+            phone,
+            values["previous_result"],
+            values["test_marks"],
+        )
+
+    def edit_selected(self):
+        student = self._selected_student()
+        if student is None:
+            return
+
+        self.editing_roll_no = student.roll_no
+        for key in self.entries:
+            entry = self.entries[key]
+            entry.delete(0, tk.END)
+            entry.insert(0, str(getattr(student, key)))
+        self.form_title.configure(text="Edit student record")
+        self.form_hint.configure(
+            text="Update the details below. The roll number will stay the same."
+        )
+        self.submit_button.configure(text="Save changes", command=self.update_student)
+        self.entries["name"].focus_set()
+
+    def update_student(self):
+        if self.editing_roll_no is None:
+            return
+        student = self._student_from_form(self.editing_roll_no)
+        if student is None:
+            return
+
+        try:
+            self.classroom.update_student(student)
+        except (OSError, pickle.PickleError) as error:
+            messagebox.showerror("Could not save changes", str(error), parent=self.root)
+            return
+
+        self.clear_form()
+        self.refresh_students()
+        messagebox.showinfo(
+            "Student updated",
+            "Changes to {} (roll number {}) have been saved.".format(
+                student.name, student.roll_no
+            ),
+            parent=self.root,
+        )
+
     def clear_form(self):
         for entry in self.entries.values():
             entry.delete(0, tk.END)
+        self.editing_roll_no = None
+        self.form_title.configure(text="Add a student")
+        self.form_hint.configure(text="Enter the details below to create a new record.")
+        self.submit_button.configure(text="Add student", command=self.add_student)
         self.entries["name"].focus_set()
 
     def refresh_students(self):

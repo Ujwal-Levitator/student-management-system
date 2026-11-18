@@ -13,3 +13,9 @@ Append an entry whenever the program or its data changes.
 ## 2026-11-18 - Project documentation
 
 - Added a README with setup instructions, feature details, data fields, and project file descriptions.
+
+## 2026-11-18 - Edit student records
+
+- Added an edit flow that loads a selected student's details into the form and keeps their roll number unchanged.
+- Reused the existing form validation and persisted updates with rollback if saving fails.
+- Documented the edit feature and added tests for update persistence and failure handling.

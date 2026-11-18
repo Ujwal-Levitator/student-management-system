@@ -8,6 +8,7 @@ A desktop student management application built with Python and Tkinter. It provi
 - Assign roll numbers automatically.
 - Search students by roll number or name.
 - View complete details for a selected student.
+- Edit student details while preserving the student's roll number.
 - Remove students from the directory.
 - Save records automatically to a local binary data file.
 - Use an atomic save operation to reduce the risk of corrupted data.
