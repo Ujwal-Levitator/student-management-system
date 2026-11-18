@@ -19,3 +19,17 @@ Append an entry whenever the program or its data changes.
 - Added an edit flow that loads a selected student's details into the form and keeps their roll number unchanged.
 - Reused the existing form validation and persisted updates with rollback if saving fails.
 - Documented the edit feature and added tests for update persistence and failure handling.
+
+## 2026-11-18 - Classroom organization
+
+- Added class and section dropdowns to student creation and editing.
+- Added a Classrooms page with classroom cards that open a filtered student roster.
+- Kept older student records available under an Unassigned classroom.
+- Changed the section field to an A-D dropdown and tightened the form layout so the lower fields remain visible.
+- Added classroom search, responsive card columns, and an edit shortcut in the student details window.
+
+## 2026-11-18 - CSV storage
+
+- Switched the active student data store to an atomic UTF-8 CSV file.
+- Added a one-time migration from the legacy binary file while preserving it as a backup.
+- Kept next roll number metadata in the CSV so deleted roll numbers are not reused after restart.

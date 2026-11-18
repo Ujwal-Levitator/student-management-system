@@ -1,0 +1,7 @@
+record_type,roll_no,name,age,address,parent_name,parent_phone,previous_result,test_marks,class_name,section,next_roll_no
+metadata,,,,,,,,,,,6
+student,1,Aanya Sharma,16,"Demo Street, Bengaluru",Neha Sharma,0000000001,Pass,92%,1,D,
+student,2,Rohan Mehta,17,"Sample Road, Pune",Amit Mehta,0000000002,Pass,86%,3,C,
+student,3,Zara Khan,15,"Example Avenue, Hyderabad",Sana Khan,0000000003,Pass,95%,,,
+student,4,Arjun Patel,16,"Demo Lane, Ahmedabad",Kiran Patel,0000000004,Pass,78%,,,
+student,5,Mira Thomas,17,"Sample Park, Kochi",Anita Thomas,0000000005,Pass,89%,,,

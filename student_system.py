@@ -1,9 +1,28 @@
+import csv
 import os
 import pickle
 import tempfile
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
+
+
+CLASS_OPTIONS = tuple(str(class_number) for class_number in range(1, 13))
+SECTION_OPTIONS = ("A", "B", "C", "D")
+CSV_COLUMNS = (
+    "record_type",
+    "roll_no",
+    "name",
+    "age",
+    "address",
+    "parent_name",
+    "parent_phone",
+    "previous_result",
+    "test_marks",
+    "class_name",
+    "section",
+    "next_roll_no",
+)
 
 
 class Student:
@@ -17,6 +36,8 @@ class Student:
         parent_phone,
         previous_result,
         test_marks,
+        class_name="",
+        section="",
     ):
         self.roll_no = roll_no
         self.name = name
@@ -26,20 +47,25 @@ class Student:
         self.parent_phone = parent_phone
         self.previous_result = previous_result
         self.test_marks = test_marks
+        self.class_name = class_name
+        self.section = section
 
 
 class _StudentUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        if module == "__main__" and name == "Student":
+        if module in ("__main__", "student_system") and name == "Student":
             return Student
-        return super().find_class(module, name)
+        raise pickle.UnpicklingError(
+            "The legacy student file contains an unsupported object."
+        )
 
 
 class Classroom:
     def __init__(self, data_file=None):
         self.data_file = Path(data_file) if data_file else Path(__file__).with_name(
-            "student_details.dat"
+            "student_details.csv"
         )
+        self.legacy_data_file = self.data_file.with_suffix(".dat")
         self.students = []
         self._students_by_roll = {}
         self.next_roll_no = 1
@@ -63,6 +89,38 @@ class Classroom:
 
     def get_student(self, roll_no):
         return self._students_by_roll.get(roll_no)
+
+    def get_classroom_counts(self):
+        counts = {}
+        for student in self.students:
+            classroom = (
+                getattr(student, "class_name", "") or "",
+                getattr(student, "section", "") or "",
+            )
+            counts[classroom] = counts.get(classroom, 0) + 1
+
+        def sort_key(item):
+            class_name, section = item[0]
+            if not class_name:
+                return (1, 0, "", section.casefold())
+            if class_name.isdigit():
+                return (0, 0, int(class_name), section.casefold())
+            return (0, 1, class_name.casefold(), section.casefold())
+
+        return dict(
+            sorted(counts.items(), key=sort_key)
+        )
+
+    def get_students_for_classroom(self, class_name, section):
+        return [
+            student
+            for student in self.students
+            if (
+                getattr(student, "class_name", "") or "",
+                getattr(student, "section", "") or "",
+            )
+            == (class_name, section)
+        ]
 
     def update_student(self, student):
         existing_student = self._students_by_roll.get(student.roll_no)
@@ -97,46 +155,147 @@ class Classroom:
 
     def save_details(self):
         self.data_file.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "students": self.students,
-            "next_roll_no": self.next_roll_no,
-        }
         temporary_path = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="wb",
+                mode="w",
+                encoding="utf-8",
+                newline="",
                 dir=str(self.data_file.parent),
                 prefix=self.data_file.name + ".",
                 suffix=".tmp",
                 delete=False,
             ) as file:
                 temporary_path = Path(file.name)
-                pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
+                writer = csv.DictWriter(file, fieldnames=CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerow(
+                    {"record_type": "metadata", "next_roll_no": self.next_roll_no}
+                )
+                for student in self.students:
+                    writer.writerow(
+                        {
+                            "record_type": "student",
+                            "roll_no": student.roll_no,
+                            "name": student.name,
+                            "age": student.age,
+                            "address": student.address,
+                            "parent_name": student.parent_name,
+                            "parent_phone": student.parent_phone,
+                            "previous_result": student.previous_result,
+                            "test_marks": student.test_marks,
+                            "class_name": getattr(student, "class_name", ""),
+                            "section": getattr(student, "section", ""),
+                        }
+                    )
             os.replace(str(temporary_path), str(self.data_file))
         finally:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink()
 
     def load_details(self):
+        if self.data_file.exists():
+            self._load_csv()
+            return
+        if not self.legacy_data_file.exists():
+            return
+
+        self._load_legacy_data()
+        self.save_details()
+
+    def _load_csv(self):
         try:
-            with self.data_file.open("rb") as file:
+            with self.data_file.open("r", encoding="utf-8", newline="") as file:
+                reader = csv.DictReader(file)
+                if reader.fieldnames is None or not set(CSV_COLUMNS).issubset(
+                    reader.fieldnames
+                ):
+                    raise ValueError("The CSV student data file has an invalid header.")
+
+                students = []
+                saved_next_roll_no = 1
+                metadata_found = False
+                for row in reader:
+                    if not row or not any(value for value in row.values()):
+                        continue
+                    if row["record_type"] == "metadata":
+                        if metadata_found:
+                            raise ValueError(
+                                "The CSV student data file contains duplicate metadata."
+                            )
+                        metadata_found = True
+                        try:
+                            saved_next_roll_no = int(row["next_roll_no"])
+                        except (TypeError, ValueError) as error:
+                            raise ValueError(
+                                "The CSV student data file has an invalid next roll number."
+                            ) from error
+                        continue
+                    if row["record_type"] != "student":
+                        raise ValueError(
+                            "The CSV student data file contains an unknown record type."
+                        )
+                    student_columns = CSV_COLUMNS[1:-1]
+                    if any(row[column] is None for column in student_columns):
+                        raise ValueError(
+                            "Incomplete student record on CSV line {}.".format(
+                                reader.line_num
+                            )
+                        )
+
+                    try:
+                        students.append(
+                            Student(
+                                int(row["roll_no"]),
+                                row["name"],
+                                int(row["age"]),
+                                row["address"],
+                                row["parent_name"],
+                                row["parent_phone"],
+                                row["previous_result"],
+                                row["test_marks"],
+                                row.get("class_name") or "",
+                                row.get("section") or "",
+                            )
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise ValueError(
+                            "Invalid student record on CSV line {}.".format(
+                                reader.line_num
+                            )
+                        ) from error
+        except csv.Error as error:
+            raise ValueError("The CSV student data file could not be parsed.") from error
+
+        self._set_students(students, saved_next_roll_no)
+
+    def _load_legacy_data(self):
+        try:
+            with self.legacy_data_file.open("rb") as file:
                 data = _StudentUnpickler(file).load()
-        except FileNotFoundError:
-            return
         except EOFError:
-            return
+            raise ValueError("The legacy student data file is empty.")
 
         if not isinstance(data, dict) or not isinstance(data.get("students"), list):
-            raise ValueError("The student data file has an invalid format.")
+            raise ValueError("The legacy student data file has an invalid format.")
+        self._set_students(data["students"], data.get("next_roll_no", 1))
 
-        self.students = data["students"]
-        self._students_by_roll = {
-            student.roll_no: student for student in self.students
-        }
-        largest_roll_no = max(self._students_by_roll, default=0) + 1
-        saved_next_roll_no = data.get("next_roll_no", 1)
+    def _set_students(self, students, saved_next_roll_no):
+        student_index = {}
+        for student in students:
+            if not isinstance(student, Student):
+                raise ValueError("The student data file contains an invalid record.")
+            if not isinstance(student.roll_no, int) or student.roll_no < 1:
+                raise ValueError("Student roll numbers must be positive whole numbers.")
+            if student.roll_no in student_index:
+                raise ValueError("The student data file contains duplicate roll numbers.")
+            student_index[student.roll_no] = student
+
         if not isinstance(saved_next_roll_no, int) or saved_next_roll_no < 1:
             saved_next_roll_no = 1
+        self.students = students
+        self._students_by_roll = student_index
+        largest_roll_no = max(student_index, default=0) + 1
         self.next_roll_no = max(largest_roll_no, saved_next_roll_no)
 
 
@@ -212,7 +371,7 @@ class StudentManagementApp:
         )
         style.configure(
             "TEntry",
-            padding=(9, 8),
+            padding=(8, 5),
             fieldbackground="#FFFFFF",
             foreground=self.colors["text"],
             bordercolor=self.colors["border"],
@@ -265,6 +424,20 @@ class StudentManagementApp:
         style.map(
             "Danger.TButton",
             background=[("active", "#FFE5E5"), ("pressed", "#FBD5D5")],
+        )
+        style.configure(
+            "ClassroomCard.TButton",
+            background="#FFFFFF",
+            foreground=self.colors["text"],
+            padding=(18, 18),
+            anchor="w",
+            justify="left",
+            font=("Segoe UI", 10, "bold"),
+            borderwidth=0,
+        )
+        style.map(
+            "ClassroomCard.TButton",
+            background=[("active", "#F5F6FF"), ("pressed", "#EEEFFF")],
         )
         style.configure(
             "Student.Treeview",
@@ -335,8 +508,13 @@ class StudentManagementApp:
             fg="#7D889B",
             font=("Segoe UI", 8, "bold"),
         ).pack(anchor="w", padx=22, pady=(0, 10))
-        self._sidebar_item(sidebar, "▦", "Overview", active=True)
-        self._sidebar_item(sidebar, "◎", "Students")
+        self.sidebar_items = {}
+        self._sidebar_item(
+            sidebar, "▦", "Overview", "overview", self.show_overview, active=True
+        )
+        self._sidebar_item(
+            sidebar, "▤", "Classrooms", "classrooms", self.show_classrooms
+        )
 
         sidebar_footer = tk.Frame(sidebar, bg=self.colors["sidebar"])
         sidebar_footer.pack(side="bottom", fill="x", padx=20, pady=22)
@@ -359,27 +537,33 @@ class StudentManagementApp:
 
         content = tk.Frame(self.root, bg=self.colors["background"])
         content.pack(side="left", fill="both", expand=True)
-        content.rowconfigure(2, weight=1)
+        content.rowconfigure(0, weight=1)
         content.columnconfigure(0, weight=1)
+        self.overview_page = tk.Frame(content, bg=self.colors["background"])
+        self.overview_page.grid(row=0, column=0, sticky="nsew")
+        self.overview_page.rowconfigure(2, weight=1)
+        self.overview_page.columnconfigure(0, weight=1)
 
-        header = tk.Frame(content, bg=self.colors["background"])
+        header = tk.Frame(self.overview_page, bg=self.colors["background"])
         header.grid(row=0, column=0, sticky="ew", padx=28, pady=(25, 18))
-        tk.Label(
+        self.page_title = tk.Label(
             header,
             text="Overview",
             bg=self.colors["background"],
             fg=self.colors["text"],
             font=("Segoe UI", 23, "bold"),
-        ).pack(anchor="w")
-        tk.Label(
+        )
+        self.page_title.pack(anchor="w")
+        self.page_subtitle = tk.Label(
             header,
             text="Manage your students and keep their details in one place.",
             bg=self.colors["background"],
             fg=self.colors["muted"],
             font=("Segoe UI", 10),
-        ).pack(anchor="w", pady=(4, 0))
+        )
+        self.page_subtitle.pack(anchor="w", pady=(4, 0))
 
-        stats = tk.Frame(content, bg=self.colors["background"])
+        stats = tk.Frame(self.overview_page, bg=self.colors["background"])
         stats.grid(row=1, column=0, sticky="ew", padx=28, pady=(0, 18))
         for column in range(3):
             stats.columnconfigure(column, weight=1, uniform="stats")
@@ -397,7 +581,7 @@ class StudentManagementApp:
         )
         self._stat_card(stats, 2, "DIRECTORY", "Ready", "Your records are saved")
 
-        workspace = tk.Frame(content, bg=self.colors["background"])
+        workspace = tk.Frame(self.overview_page, bg=self.colors["background"])
         workspace.grid(row=2, column=0, sticky="nsew", padx=28, pady=(0, 24))
         workspace.columnconfigure(1, weight=1)
         workspace.rowconfigure(0, weight=1)
@@ -407,22 +591,46 @@ class StudentManagementApp:
             bg=self.colors["surface"],
             highlightthickness=1,
             highlightbackground=self.colors["border"],
-            padx=17,
-            pady=16,
+            padx=13,
+            pady=10,
         )
         form.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
         form.columnconfigure(1, weight=1)
-        self.form_title = ttk.Label(form, text="Add a student", style="PanelTitle.TLabel")
-        self.form_title.grid(row=0, column=0, columnspan=2, sticky="w")
+        form.columnconfigure(3, weight=1)
+        self.form_title = ttk.Label(
+            form, text="Add a student", style="PanelTitle.TLabel"
+        )
+        self.form_title.grid(row=0, column=0, columnspan=4, sticky="w")
         self.form_hint = ttk.Label(
             form,
             text="Enter the details below to create a new record.",
             style="PanelHint.TLabel",
             wraplength=265,
         )
-        self.form_hint.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 14))
+        self.form_hint.grid(row=1, column=0, columnspan=4, sticky="w", pady=(4, 10))
 
         self.entries = {}
+        ttk.Label(form, text="Class", style="FormLabel.TLabel").grid(
+            row=2, column=0, sticky="w", pady=2, padx=(0, 8)
+        )
+        self.entries["class_name"] = ttk.Combobox(
+            form,
+            values=CLASS_OPTIONS,
+            state="readonly",
+            width=7,
+        )
+        self.entries["class_name"].grid(row=2, column=1, sticky="ew", pady=2)
+        ttk.Label(form, text="Section", style="FormLabel.TLabel").grid(
+            row=2, column=2, sticky="w", pady=2, padx=(8, 8)
+        )
+        self.entries["section"] = ttk.Combobox(
+            form,
+            values=SECTION_OPTIONS,
+            state="readonly",
+            width=7,
+        )
+        self.entries["section"].grid(row=2, column=3, sticky="ew", pady=2)
+
         fields = (
             ("Name", "name"),
             ("Age", "age"),
@@ -432,12 +640,12 @@ class StudentManagementApp:
             ("Previous result", "previous_result"),
             ("Test marks", "test_marks"),
         )
-        for row, (label, key) in enumerate(fields, start=2):
+        for row, (label, key) in enumerate(fields, start=3):
             ttk.Label(form, text=label, style="FormLabel.TLabel").grid(
-                row=row, column=0, sticky="w", pady=5, padx=(0, 8)
+                row=row, column=0, sticky="w", pady=2, padx=(0, 8)
             )
             entry = ttk.Entry(form, width=19)
-            entry.grid(row=row, column=1, sticky="ew", pady=5)
+            entry.grid(row=row, column=1, columnspan=3, sticky="ew", pady=2)
             self.entries[key] = entry
 
         self.editing_roll_no = None
@@ -445,11 +653,11 @@ class StudentManagementApp:
             form, text="Add student", command=self.add_student
         )
         self.submit_button.grid(
-            row=len(fields) + 2,
+            row=len(fields) + 3,
             column=0,
-            columnspan=2,
+            columnspan=4,
             sticky="ew",
-            pady=(14, 6),
+            pady=(8, 4),
         )
         ttk.Button(
             form,
@@ -457,7 +665,7 @@ class StudentManagementApp:
             command=self.clear_form,
             style="Secondary.TButton",
         ).grid(
-            row=len(fields) + 3, column=0, columnspan=2, sticky="ew"
+            row=len(fields) + 4, column=0, columnspan=4, sticky="ew"
         )
 
         roster = tk.Frame(
@@ -477,11 +685,12 @@ class StudentManagementApp:
         ttk.Label(roster_header, text="Student directory", style="PanelTitle.TLabel").pack(
             anchor="w"
         )
-        ttk.Label(
+        self.roster_hint = ttk.Label(
             roster_header,
             text="Browse, search, and manage student records.",
             style="PanelHint.TLabel",
-        ).pack(anchor="w", pady=(4, 0))
+        )
+        self.roster_hint.pack(anchor="w", pady=(4, 0))
 
         search_row = ttk.Frame(roster)
         search_row.grid(row=1, column=0, sticky="ew", pady=(0, 12))
@@ -495,7 +704,14 @@ class StudentManagementApp:
             side="left", fill="x", expand=True
         )
 
-        columns = ("roll_no", "name", "age", "parent_phone")
+        columns = (
+            "roll_no",
+            "name",
+            "class_name",
+            "section",
+            "age",
+            "parent_phone",
+        )
         self.tree = ttk.Treeview(
             roster,
             columns=columns,
@@ -505,7 +721,9 @@ class StudentManagementApp:
         )
         headings = {
             "roll_no": ("ROLL NO.", 80),
-            "name": ("STUDENT", 170),
+            "name": ("STUDENT", 145),
+            "class_name": ("CLASS", 70),
+            "section": ("SECTION", 70),
             "age": ("AGE", 55),
             "parent_phone": ("PARENT PHONE", 120),
         }
@@ -541,28 +759,260 @@ class StudentManagementApp:
             style="Danger.TButton",
         ).pack(side="right")
 
-    def _sidebar_item(self, parent, icon, label, active=False):
+        self.selected_classroom = None
+        self.classrooms_page = tk.Frame(content, bg=self.colors["background"])
+        self.classrooms_page.grid(row=0, column=0, sticky="nsew")
+        self.classrooms_page.rowconfigure(2, weight=1)
+        self.classrooms_page.columnconfigure(0, weight=1)
+
+        classrooms_header = tk.Frame(
+            self.classrooms_page, bg=self.colors["background"]
+        )
+        classrooms_header.grid(row=0, column=0, sticky="ew", padx=28, pady=(25, 18))
+        tk.Label(
+            classrooms_header,
+            text="Classrooms",
+            bg=self.colors["background"],
+            fg=self.colors["text"],
+            font=("Segoe UI", 23, "bold"),
+        ).pack(anchor="w")
+        self.classrooms_summary = tk.Label(
+            classrooms_header,
+            text="Browse students by class and section.",
+            bg=self.colors["background"],
+            fg=self.colors["muted"],
+            font=("Segoe UI", 10),
+        )
+        self.classrooms_summary.pack(anchor="w", pady=(4, 0))
+
+        classroom_toolbar = tk.Frame(
+            self.classrooms_page, bg=self.colors["background"]
+        )
+        classroom_toolbar.grid(
+            row=1, column=0, sticky="ew", padx=28, pady=(0, 14)
+        )
+        classroom_toolbar.columnconfigure(1, weight=1)
+        ttk.Label(classroom_toolbar, text="Find classroom").grid(
+            row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        self.classroom_search_var = tk.StringVar()
+        self.classroom_search_var.trace_add(
+            "write", lambda *_: self.refresh_classrooms()
+        )
+        classroom_search = ttk.Entry(
+            classroom_toolbar, textvariable=self.classroom_search_var
+        )
+        classroom_search.grid(row=0, column=1, sticky="ew")
+        ttk.Button(
+            classroom_toolbar,
+            text="Clear",
+            command=lambda: self.classroom_search_var.set(""),
+            style="Secondary.TButton",
+        ).grid(row=0, column=2, padx=(8, 0))
+
+        classrooms_panel = tk.Frame(
+            self.classrooms_page,
+            bg=self.colors["surface"],
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            padx=17,
+            pady=16,
+        )
+        classrooms_panel.grid(row=2, column=0, sticky="nsew", padx=28, pady=(0, 24))
+        classrooms_panel.rowconfigure(0, weight=1)
+        classrooms_panel.columnconfigure(0, weight=1)
+        self.classrooms_canvas = tk.Canvas(
+            classrooms_panel,
+            background=self.colors["surface"],
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.classrooms_canvas.grid(row=0, column=0, sticky="nsew")
+        classrooms_scrollbar = ttk.Scrollbar(
+            classrooms_panel,
+            orient="vertical",
+            command=self.classrooms_canvas.yview,
+        )
+        classrooms_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.classrooms_canvas.configure(yscrollcommand=classrooms_scrollbar.set)
+        self.classroom_cards = tk.Frame(
+            self.classrooms_canvas, bg=self.colors["surface"]
+        )
+        self.classroom_cards_window = self.classrooms_canvas.create_window(
+            (0, 0), window=self.classroom_cards, anchor="nw"
+        )
+        self.classroom_grid_columns = 3
+        self.classroom_cards.bind(
+            "<Configure>",
+            lambda _event: self.classrooms_canvas.configure(
+                scrollregion=self.classrooms_canvas.bbox("all")
+            ),
+        )
+        self.classrooms_canvas.bind(
+            "<Configure>",
+            self._resize_classroom_grid,
+        )
+        for column in range(3):
+            self.classroom_cards.columnconfigure(
+                column, weight=1, uniform="classrooms"
+            )
+        self.overview_page.tkraise()
+
+    def _sidebar_item(self, parent, icon, label, page, command, active=False):
         background = "#29334A" if active else self.colors["sidebar"]
         row = tk.Frame(parent, bg=background, height=42)
         row.pack(fill="x", padx=12, pady=3)
         row.pack_propagate(False)
-        if active:
-            tk.Frame(row, bg=self.colors["accent"], width=3).pack(side="left", fill="y")
-        tk.Label(
+        indicator = tk.Frame(
+            row,
+            bg=self.colors["accent"] if active else self.colors["sidebar"],
+            width=3,
+        )
+        indicator.pack(side="left", fill="y")
+        icon_label = tk.Label(
             row,
             text=icon,
             bg=background,
             fg="#BFC7D5" if not active else "#FFFFFF",
             font=("Segoe UI", 12),
             width=3,
-        ).pack(side="left", padx=(7, 3))
-        tk.Label(
+        )
+        icon_label.pack(side="left", padx=(7, 3))
+        text_label = tk.Label(
             row,
             text=label,
             bg=background,
             fg="#FFFFFF" if active else self.colors["sidebar_muted"],
             font=("Segoe UI", 9, "bold" if active else "normal"),
-        ).pack(side="left")
+        )
+        text_label.pack(side="left")
+        for widget in (row, icon_label, text_label):
+            widget.bind("<Button-1>", lambda _event: command())
+        self.sidebar_items[page] = (row, indicator, icon_label, text_label)
+
+    def _set_active_sidebar_item(self, active_page):
+        for page, widgets in self.sidebar_items.items():
+            row, indicator, icon_label, text_label = widgets
+            active = page == active_page
+            background = "#29334A" if active else self.colors["sidebar"]
+            row.configure(bg=background)
+            indicator.configure(
+                bg=self.colors["accent"] if active else self.colors["sidebar"]
+            )
+            icon_label.configure(
+                bg=background, fg="#FFFFFF" if active else "#BFC7D5"
+            )
+            text_label.configure(
+                bg=background,
+                fg="#FFFFFF" if active else self.colors["sidebar_muted"],
+                font=("Segoe UI", 9, "bold" if active else "normal"),
+            )
+
+    @staticmethod
+    def _classroom_label(class_name, section):
+        if not class_name and not section:
+            return "Unassigned"
+        label = "Class {}".format(class_name) if class_name else "Unassigned"
+        return "{} - {}".format(label, section) if section else label
+
+    def show_overview(self):
+        self.selected_classroom = None
+        self.page_title.configure(text="Overview")
+        self.page_subtitle.configure(
+            text="Manage your students and keep their details in one place."
+        )
+        self.overview_page.tkraise()
+        self._set_active_sidebar_item("overview")
+        self.refresh_students()
+
+    def show_classrooms(self):
+        self.refresh_classrooms()
+        self.classrooms_page.tkraise()
+        self._set_active_sidebar_item("classrooms")
+
+    def _resize_classroom_grid(self, event):
+        self.classrooms_canvas.itemconfigure(
+            self.classroom_cards_window, width=event.width
+        )
+        columns = max(1, min(3, event.width // 250))
+        if columns != self.classroom_grid_columns:
+            self.classroom_grid_columns = columns
+            self.refresh_classrooms()
+
+    def open_classroom(self, class_name, section):
+        self.selected_classroom = (class_name, section)
+        self.clear_form()
+        self.search_var.set("")
+        label = self._classroom_label(class_name, section)
+        self.page_title.configure(text=label)
+        self.page_subtitle.configure(text="Students assigned to this classroom.")
+        self.overview_page.tkraise()
+        self._set_active_sidebar_item("classrooms")
+        self.refresh_students()
+
+    def refresh_classrooms(self):
+        for child in self.classroom_cards.winfo_children():
+            child.destroy()
+
+        classroom_counts = self.classroom.get_classroom_counts()
+        student_count = len(self.classroom.students)
+        classroom_count = len(classroom_counts)
+        self.classrooms_summary.configure(
+            text="{} classroom{} · {} student{}".format(
+                classroom_count,
+                "" if classroom_count == 1 else "s",
+                student_count,
+                "" if student_count == 1 else "s",
+            )
+        )
+        query = self.classroom_search_var.get().strip().casefold()
+        matching_classrooms = []
+        for (class_name, section), count in classroom_counts.items():
+            label = self._classroom_label(class_name, section)
+            if not query or query in label.casefold():
+                matching_classrooms.append(
+                    ((class_name, section), count, label)
+                )
+
+        columns = self.classroom_grid_columns
+        for column in range(3):
+            self.classroom_cards.columnconfigure(
+                column, weight=1 if column < columns else 0
+            )
+
+        if not matching_classrooms:
+            if classroom_count:
+                message = "No classrooms match your search. Clear the search to see them all."
+            else:
+                message = "No classrooms yet. Add a student and assign a class and section."
+            ttk.Label(
+                self.classroom_cards,
+                text=message,
+                style="PanelHint.TLabel",
+                wraplength=460,
+            ).grid(row=0, column=0, columnspan=columns, sticky="w", padx=8, pady=8)
+            return
+
+        for index, ((class_name, section), count, label) in enumerate(
+            matching_classrooms
+        ):
+            button = ttk.Button(
+                self.classroom_cards,
+                text="{}\n{} student{}".format(
+                    label, count, "" if count == 1 else "s"
+                ),
+                command=lambda class_name=class_name, section=section: self.open_classroom(
+                    class_name, section
+                ),
+                style="ClassroomCard.TButton",
+            )
+            button.grid(
+                row=index // columns,
+                column=index % columns,
+                sticky="ew",
+                padx=8,
+                pady=8,
+            )
 
     def _stat_card(self, parent, column, title, value, note, accent=False):
         background = self.colors["accent"] if accent else self.colors["surface"]
@@ -613,12 +1063,13 @@ class StudentManagementApp:
 
         try:
             self.classroom.add_student(student)
-        except (OSError, pickle.PickleError) as error:
+        except (OSError, csv.Error) as error:
             messagebox.showerror("Could not save student", str(error), parent=self.root)
             return
 
         self.clear_form()
         self.refresh_students()
+        self.refresh_classrooms()
         messagebox.showinfo(
             "Student added",
             "Student added with roll number {}.".format(student.roll_no),
@@ -653,6 +1104,7 @@ class StudentManagementApp:
             )
             return None
 
+        values["section"] = values["section"].upper()
         return Student(
             roll_no,
             values["name"],
@@ -662,6 +1114,8 @@ class StudentManagementApp:
             phone,
             values["previous_result"],
             values["test_marks"],
+            values["class_name"],
+            values["section"],
         )
 
     def edit_selected(self):
@@ -669,11 +1123,18 @@ class StudentManagementApp:
         if student is None:
             return
 
+        self._load_student_into_form(student)
+
+    def _load_student_into_form(self, student):
         self.editing_roll_no = student.roll_no
         for key in self.entries:
             entry = self.entries[key]
-            entry.delete(0, tk.END)
-            entry.insert(0, str(getattr(student, key)))
+            value = str(getattr(student, key, ""))
+            if key in ("class_name", "section"):
+                entry.set(value)
+            else:
+                entry.delete(0, tk.END)
+                entry.insert(0, value)
         self.form_title.configure(text="Edit student record")
         self.form_hint.configure(
             text="Update the details below. The roll number will stay the same."
@@ -690,12 +1151,13 @@ class StudentManagementApp:
 
         try:
             self.classroom.update_student(student)
-        except (OSError, pickle.PickleError) as error:
+        except (OSError, csv.Error) as error:
             messagebox.showerror("Could not save changes", str(error), parent=self.root)
             return
 
         self.clear_form()
         self.refresh_students()
+        self.refresh_classrooms()
         messagebox.showinfo(
             "Student updated",
             "Changes to {} (roll number {}) have been saved.".format(
@@ -705,12 +1167,19 @@ class StudentManagementApp:
         )
 
     def clear_form(self):
-        for entry in self.entries.values():
-            entry.delete(0, tk.END)
+        for key, entry in self.entries.items():
+            if key in ("class_name", "section"):
+                entry.set("")
+            else:
+                entry.delete(0, tk.END)
         self.editing_roll_no = None
         self.form_title.configure(text="Add a student")
         self.form_hint.configure(text="Enter the details below to create a new record.")
         self.submit_button.configure(text="Add student", command=self.add_student)
+        if self.selected_classroom is not None:
+            class_name, section = self.selected_classroom
+            self.entries["class_name"].set(class_name)
+            self.entries["section"].set(section)
         self.entries["name"].focus_set()
 
     def refresh_students(self):
@@ -718,7 +1187,14 @@ class StudentManagementApp:
         for item in self.tree.get_children():
             self.tree.delete(item)
         row_number = 0
-        for student in self.classroom.students:
+        students = self.classroom.students
+        if self.selected_classroom is not None:
+            students = self.classroom.get_students_for_classroom(
+                *self.selected_classroom
+            )
+        for student in students:
+            class_name = getattr(student, "class_name", "") or ""
+            section = getattr(student, "section", "") or ""
             if query and query not in str(student.roll_no).casefold() and query not in student.name.casefold():
                 continue
             self.tree.insert(
@@ -728,16 +1204,28 @@ class StudentManagementApp:
                 values=(
                     student.roll_no,
                     student.name,
+                    class_name or "—",
+                    section or "—",
                     student.age,
                     student.parent_phone,
                 ),
                 tags=("even" if row_number % 2 == 0 else "odd",),
             )
             row_number += 1
-        self.count_label.configure(
-            text=str(len(self.classroom.students))
-        )
+        self.count_label.configure(text=str(len(self.classroom.students)))
         self.next_roll_label.configure(text=str(self.classroom.next_roll_no))
+        if self.selected_classroom is None:
+            self.roster_hint.configure(
+                text="Browse, search, and manage student records. {} total.".format(
+                    len(self.classroom.students)
+                )
+            )
+        else:
+            self.roster_hint.configure(
+                text="{} student{} in this classroom.".format(
+                    row_number, "" if row_number == 1 else "s"
+                )
+            )
 
     def _selected_student(self):
         selection = self.tree.selection()
@@ -758,9 +1246,12 @@ class StudentManagementApp:
         window = tk.Toplevel(self.root)
         window.title("Student details")
         window.resizable(False, False)
+        window.transient(self.root)
         details = (
             ("Roll number", student.roll_no),
             ("Name", student.name),
+            ("Class", getattr(student, "class_name", "") or "Unassigned"),
+            ("Section", getattr(student, "section", "") or "—"),
             ("Age", student.age),
             ("Address", student.address),
             ("Parent / guardian", student.parent_name),
@@ -777,9 +1268,40 @@ class StudentManagementApp:
             ttk.Label(frame, text=str(value), wraplength=320).grid(
                 row=row, column=1, sticky="nw", pady=4
             )
-        ttk.Button(frame, text="Close", command=window.destroy).grid(
+        actions = ttk.Frame(frame)
+        actions.grid(
             row=len(details), column=0, columnspan=2, sticky="e", pady=(12, 0)
         )
+        ttk.Button(
+            actions,
+            text="Edit details",
+            command=lambda: self.edit_details_from_window(
+                student.roll_no, window
+            ),
+            style="Accent.TButton",
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            actions, text="Close", command=window.destroy, style="Secondary.TButton"
+        ).pack(side="left")
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.grab_set()
+
+    def edit_details_from_window(self, roll_no, window):
+        student = self.classroom.get_student(roll_no)
+        if student is None:
+            messagebox.showerror(
+                "Could not edit student",
+                "This student record is no longer available.",
+                parent=window,
+            )
+            return
+
+        window.destroy()
+        class_name = getattr(student, "class_name", "") or ""
+        section = getattr(student, "section", "") or ""
+        self.open_classroom(class_name, section)
+        self.tree.selection_set(str(student.roll_no))
+        self._load_student_into_form(student)
 
     def remove_selected(self):
         student = self._selected_student()
@@ -794,15 +1316,16 @@ class StudentManagementApp:
 
         try:
             self.classroom.remove_student(student.roll_no)
-        except (OSError, pickle.PickleError) as error:
+        except (OSError, csv.Error) as error:
             messagebox.showerror("Could not save changes", str(error), parent=self.root)
             return
         self.refresh_students()
+        self.refresh_classrooms()
 
     def close(self):
         try:
             self.classroom.save_details()
-        except (OSError, pickle.PickleError) as error:
+        except (OSError, csv.Error) as error:
             messagebox.showerror("Could not save data", str(error), parent=self.root)
             return
         self.root.destroy()
